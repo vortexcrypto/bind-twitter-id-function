@@ -1,7 +1,11 @@
 use std::str::FromStr;
 
+use regex::Regex;
 pub use switchboard_solana::get_ixn_discriminator;
 pub use switchboard_solana::prelude::*;
+use twitter_v2::authorization::BearerToken;
+use twitter_v2::query::UserField;
+use twitter_v2::TwitterApi;
 
 mod params;
 pub use params::*;
@@ -21,10 +25,16 @@ async fn main() {
     )
     .unwrap();
 
-    // Retrieve provided twitter_user_id BIO
-    // Parse BIO to read the last line
-    // Last line must match the provided user key
-    let validated = true;
+    // Retrieve provided twitter_username BIO
+    // Parse BIO and extract wallet address
+    // wallet must match provided wallet
+    let auth = BearerToken::new("APP_BEARER_TOKEN");
+    let twitter_api = TwitterApi::new(auth);
+
+    let maybe_wallet =
+        get_wallet_from_user_bio(&twitter_api, params.twitter_username.as_str()).await;
+
+    let validated: bool = maybe_wallet.is_ok() && maybe_wallet.unwrap().eq(&params.wallet);
 
     // IXN DATA:
     // LEN: 12 bytes
@@ -38,7 +48,7 @@ async fn main() {
     // 2. User: our user who made the request
     // 3. Realm
     // 4. User Account PDA
-    // 5. 
+    // 5.
     // 6. Switchboard Function
     // 7. Switchboard Function Request
     let settle_ixn = Instruction {
@@ -62,4 +72,106 @@ async fn main() {
     // Finally, emit the signed quote and partially signed transaction to the functionRunner oracle
     // The functionRunner oracle will use the last outputted word to stdout as the serialized result. This is what gets executed on-chain.
     runner.emit(ixs).await.unwrap();
+}
+
+pub async fn get_user_by_username(
+    twitter_api: &TwitterApi<BearerToken>,
+    username: &str,
+    user_fields: Vec<twitter_v2::query::UserField>,
+) -> std::result::Result<twitter_v2::data::User, SbError> {
+    if let Some(user) = twitter_api
+        .get_user_by_username(username)
+        .user_fields(user_fields.into_iter())
+        .send()
+        .await
+        .map_err(|e| {
+            println!("err getting user: {:?}", e);
+
+            SbError::CustomMessage("err getting user".to_string())
+        })?
+        .data()
+    {
+        return Ok(user.clone());
+    }
+
+    Err(SbError::CustomMessage("user not found".to_string()))
+}
+
+pub fn extract_solana_wallet_address_from_string(
+    str: &str,
+) -> std::result::Result<String, SbError> {
+    let re = Regex::new(r"[1-9A-HJ-NP-Za-km-z]{32,44}").unwrap();
+
+    let matches: Vec<_> = re.captures_iter(str).collect();
+
+    if matches.len() != 1 {
+        return Err(SbError::CustomMessage("wallet not found".to_string()));
+    }
+
+    let wallet = String::from_str(matches.first().unwrap().get(0).unwrap().as_str()).unwrap();
+
+    Ok(wallet)
+}
+
+pub async fn get_wallet_from_user_bio(
+    twitter_api: &TwitterApi<BearerToken>,
+    username: &str,
+) -> std::result::Result<Pubkey, SbError> {
+    let user = get_user_by_username(twitter_api, username, vec![UserField::Description]).await?;
+
+    println!("user: {:?}", user);
+
+    if let Some(description) = user.description {
+        let wallet = extract_solana_wallet_address_from_string(description.as_str())?;
+
+        let maybe_pubkey = Pubkey::from_str(wallet.as_str());
+
+        if maybe_pubkey.is_err() {
+            return Err(SbError::CustomMessage(
+                "wallet is not a valid pubkey".to_string(),
+            ));
+        }
+
+        return Ok(maybe_pubkey.unwrap());
+    }
+
+    Err(SbError::CustomMessage("wallet not found".to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    pub fn test_extract_wallet() {
+        let wallet = extract_solana_wallet_address_from_string(
+            "hello how are you? F4hzp6TKSUJ5xvXzcQwvBH3XTmYJ16HuTX9t4gNQabib",
+        )
+        .unwrap();
+
+        assert_eq!(wallet, "F4hzp6TKSUJ5xvXzcQwvBH3XTmYJ16HuTX9t4gNQabib");
+    }
+
+    #[test]
+    pub fn test_extract_multiple_wallet() {
+        assert!(extract_solana_wallet_address_from_string(
+            "hello CkbxaunPif9H3Zq24nyY81pKUe64GRteciPL5qXLUdzC how are you? F4hzp6TKSUJ5xvXzcQwvBH3XTmYJ16HuTX9t4gNQabib",
+        ).is_err());
+    }
+
+    #[tokio::test]
+    pub async fn test_extract_wallet_from_twitter_bio() {
+        // Use dev@vortexcrypto.io dev account
+        let auth = BearerToken::new("APP_BEARER_TOKEN");
+        let twitter_api = TwitterApi::new(auth);
+
+        let wallet = get_wallet_from_user_bio(&twitter_api, "orelsanpls")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            wallet,
+            Pubkey::from_str("WabxR2gcdMgovS6Uo5JD4Cv9me7uExRyaH4QDKrp64b").unwrap()
+        );
+    }
 }
